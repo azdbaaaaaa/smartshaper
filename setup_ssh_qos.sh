@@ -19,7 +19,7 @@ echo "============================"
 
 # === 环境检查 ===
 echo "[*] 检查依赖..."
-for cmd in tc iptables journalctl systemctl; do
+for cmd in tc iptables journalctl systemctl ss; do
   if ! command -v $cmd >/dev/null 2>&1; then
     echo "未找到命令: $cmd, 请安装后重试"
     exit 1
@@ -28,63 +28,71 @@ done
 
 # === 创建主限速脚本 ===
 echo "[*] 创建主脚本 $SCRIPT_PATH ..."
-sudo tee "$SCRIPT_PATH" >/dev/null <<EOF
+sudo tee "$SCRIPT_PATH" >/dev/null <<'EOSCRIPT'
 #!/bin/bash
-DEV="$DEV"
-UP="$UP"
-DOWN="$DOWN"
-BACKUP_DIR="$BACKUP_DIR"
-LOG_FILE="$LOG_FILE"
+DEV="{{DEV}}"
+UP="{{UP}}"
+DOWN="{{DOWN}}"
+BACKUP_DIR="{{BACKUP_DIR}}"
+LOG_FILE="{{LOG_FILE}}"
 TC_BIN="/sbin/tc"
 IPTABLES_BIN="/sbin/iptables"
 
-mkdir -p "\$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
 
 log() {
-  echo "\$(date '+%F %T') \$*" | tee -a "\$LOG_FILE"
+  echo "$(date '+%F %T') $*" | tee -a "$LOG_FILE"
 }
 
 # === 备份规则 ===
 log "[*] 备份现有规则..."
-\$TC_BIN -s qdisc show dev \$DEV > "\$BACKUP_DIR/qdisc_\$(date +%F_%H%M%S).bak" 2>/dev/null || true
-\$IPTABLES_BIN -t mangle -S > "\$BACKUP_DIR/iptables_\$(date +%F_%H%M%S).bak" 2>/dev/null || true
+$TC_BIN -s qdisc show dev $DEV > "$BACKUP_DIR/qdisc_$(date +%F_%H%M%S).bak" 2>/dev/null || true
+$IPTABLES_BIN -t mangle -S > "$BACKUP_DIR/iptables_$(date +%F_%H%M%S).bak" 2>/dev/null || true
 
 # === 清理旧规则 ===
 log "[*] 重置 tc 规则..."
-\$TC_BIN qdisc del dev \$DEV root 2>/dev/null || true
-\$TC_BIN qdisc add dev \$DEV root handle 1: htb default 30
-\$TC_BIN class add dev \$DEV parent 1: classid 1:1 htb rate \${UP}
+$TC_BIN qdisc del dev $DEV root 2>/dev/null || true
+$TC_BIN qdisc add dev $DEV root handle 1: htb default 30
+$TC_BIN class add dev $DEV parent 1: classid 1:1 htb rate ${UP}
 
+# === 添加 IP 限速函数 ===
 add_ip_limit() {
-  local ip="\$1"
+  local ip="$1"
   local mark
-  mark=\$(printf "%d" 0x\$(echo "\$ip" | md5sum | cut -c1-4))
-  if \$IPTABLES_BIN -t mangle -C PREROUTING -s \$ip -j MARK --set-mark \$mark 2>/dev/null; then
+  mark=$(printf "%d" 0x$(echo "$ip" | md5sum | cut -c1-4))
+  if $IPTABLES_BIN -t mangle -C PREROUTING -s $ip -j MARK --set-mark $mark 2>/dev/null; then
     return
   fi
-  \$IPTABLES_BIN -t mangle -A PREROUTING -s \$ip -j MARK --set-mark \$mark
-  \$TC_BIN class add dev \$DEV parent 1:1 classid 1:\$mark htb rate \${UP}
-  \$TC_BIN filter add dev \$DEV parent 1: protocol ip handle \$mark fw flowid 1:\$mark
-  log "[+] 已为 \$ip 添加限速 (\$UP / \$DOWN)"
+  $IPTABLES_BIN -t mangle -A PREROUTING -s $ip -j MARK --set-mark $mark
+  $TC_BIN class add dev $DEV parent 1:1 classid 1:$mark htb rate ${UP}
+  $TC_BIN filter add dev $DEV parent 1: protocol ip handle $mark fw flowid 1:$mark
+  log "[+] 已为 $ip 添加限速 ($UP / $DOWN)"
 }
 
 # === 初始化：对当前 SSH 连接应用限速 ===
 log "[*] 检测当前 SSH 会话..."
-for ip in \$(ss -tn sport = :22 | awk 'NR>1{print \$6}' | cut -d':' -f1 | sort -u); do
-  [ -n "\$ip" ] && add_ip_limit "\$ip"
+for ip in $(ss -tn sport = :22 | awk 'NR>1{print $6}' | cut -d':' -f1 | sort -u); do
+  [ -n "$ip" ] && add_ip_limit "$ip"
 done
 
 # === 动态监控 SSH 登录 ===
 log "[*] 启动 SSH 登录监听..."
 journalctl -u sshd -f -n0 --no-pager | while read -r line; do
-  if [[ "\$line" =~ "Accepted" && "\$line" =~ "from" ]]; then
-    ip=\$(echo "\$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
-    [ -n "\$ip" ] && add_ip_limit "\$ip"
+  if [[ "$line" =~ "Accepted" && "$line" =~ "from" ]]; then
+    ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    [ -n "$ip" ] && add_ip_limit "$ip"
   fi
 done
-EOF
+EOSCRIPT
 
-chmod +x "$SCRIPT_PATH"
+# 替换变量
+sudo sed -i "s|{{DEV}}|$DEV|g" "$SCRIPT_PATH"
+sudo sed -i "s|{{UP}}|$UP|g" "$SCRIPT_PATH"
+sudo sed -i "s|{{DOWN}}|$DOWN|g" "$SCRIPT_PATH"
+sudo sed -i "s|{{BACKUP_DIR}}|$BACKUP_DIR|g" "$SCRIPT_PATH"
+sudo sed -i "s|{{LOG_FILE}}|$LOG_FILE|g" "$SCRIPT_PATH"
+
+sudo chmod +x "$SCRIPT_PATH"
 
 # === 创建 systemd 服务 ===
 echo "[*] 创建 systemd 服务 ..."
@@ -116,5 +124,4 @@ echo "规则备份目录: $BACKUP_DIR"
 echo "检查服务状态: systemctl status ssh-qos"
 echo "查看日志: tail -f $LOG_FILE"
 echo "============================"
-EOF
 
