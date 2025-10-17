@@ -52,7 +52,7 @@ $IPTABLES_BIN -t mangle -S > "$BACKUP_DIR/iptables_$(date +%F_%H%M%S).bak" 2>/de
 # === Reset old rules ===
 log "[*] Resetting tc rules..."
 $TC_BIN qdisc del dev $DEV root 2>/dev/null || true
-$TC_BIN qdisc add dev $DEV root handle 1: htb default 30
+$TC_BIN qdisc add dev $DEV root handle 1: htb default 30 r2q 1000
 $TC_BIN class add dev $DEV parent 1: classid 1:1 htb rate ${UP}
 
 # === Function to add per-IP limit ===
