@@ -105,8 +105,6 @@ After=network.target
 ExecStart=$SCRIPT_PATH
 Restart=always
 RestartSec=5
-StandardOutput=append:$LOG_FILE
-StandardError=append:$LOG_FILE
 
 [Install]
 WantedBy=multi-user.target
